@@ -44,9 +44,10 @@ class ADXLiveTraderFixed:
         
         # Trading Settings
         self.symbol = "Volatility 100 (1s) Index.0"
-        self.lot_size = 1.0  # Will be dynamically calculated
+        # Lot size will be calculated dynamically using Kelly from balance/trade stats
+        self.lot_size = None
         self.magic_number = 987654321
-        self.deviation = 20
+        self.deviation = 5
         
         # Position Sizing Parameters for V100 (1s)
         self.min_lot = 0.2      # Minimum lot size for V100 (1s)
@@ -54,10 +55,11 @@ class ADXLiveTraderFixed:
         self.lot_step = 0.01    # Volume step
         
         # Kelly Criterion Settings
-        self.kelly_fraction = 0.25  # Use 25% Kelly (fractional Kelly for safety)
+        self.kelly_fraction = 0.75  # Match backtest scaling
         self.min_trades_for_kelly = 10  # Minimum trades needed before using Kelly
-        self.max_risk_per_trade = 0.1  # Maximum 10% risk per trade
+        self.max_risk_per_trade = 0.75  # Align with backtest cap
         self.use_kelly = True  # Enable/disable Kelly sizing
+        self.use_session_kelly = True  # If True, size from realized session P&L only
         
         # ADX Settings
         self.analysis_length = 14
@@ -77,16 +79,18 @@ class ADXLiveTraderFixed:
         self.total_pnl = 0.0
         self.winning_trades = 0
         self.losing_trades = 0
+        # realized P&L list for session-based Kelly (store dicts with pnl and volume)
+        self.session_pnls = []
 
         # Safety: Position moderation
         self.moderator = PositionModerator()
         self.pause_on_fault = True
         
-        print("ADX Live Trader with Kelly Criterion initialized")
+        print("METACOG Live Trader initialized")
         print(f"Symbol: {self.symbol}")
         print(f"Kelly Fraction: {self.kelly_fraction * 100}% (Fractional Kelly)")
         print(f"Min Lot: {self.min_lot}, Max Lot: {self.max_lot}")
-        print(f"ADX Length: {self.analysis_length}")
+        print(f"METACOG Length: {self.analysis_length}")
         print("=" * 60)
 
     def connect_mt5(self) -> bool:
@@ -133,17 +137,34 @@ class ADXLiveTraderFixed:
             print(f"Error getting current price: {e}")
             return None
 
-    def get_historical_data(self, bars: int = 500):
+    def get_m1_from_ticks(self, minutes: int = 500):
+        """Build 1-minute OHLC from ticks using mid price, matching backtest pipeline."""
         try:
-            rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 0, bars)
-            if rates is None or len(rates) == 0:
+            to_time = datetime.now()
+            from_time = to_time - timedelta(minutes=minutes + 2)
+            ticks = mt5.copy_ticks_range(self.symbol, from_time, to_time, mt5.COPY_TICKS_ALL)
+            if ticks is None or len(ticks) == 0:
                 return None
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
+            df = pd.DataFrame(ticks)
+            # Convert time
+            if 'time_msc' in df.columns and df['time_msc'].notna().any():
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+            else:
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+            # Ensure bid/ask exist
+            if 'bid' not in df.columns or 'ask' not in df.columns:
+                return None
+            # Mid price as in backtest
+            df['price'] = (df['bid'] + df['ask']) / 2.0
             df.set_index('time', inplace=True)
-            return df[['open', 'high', 'low', 'close']]
+            ohlc = df['price'].resample('1min').ohlc()
+            ohlc = ohlc.dropna()
+            # Exclude the last potentially incomplete bar
+            if len(ohlc) > 0:
+                ohlc = ohlc.iloc[:-1]
+            return ohlc[['open', 'high', 'low', 'close']]
         except Exception as e:
-            print(f"Error getting historical data: {e}")
+            print(f"Error building M1 from ticks: {e}")
             return None
     
     def get_trade_history(self):
@@ -177,11 +198,13 @@ class ADXLiveTraderFixed:
             trades = []
             for _, deal in df_deals.iterrows():
                 if deal['entry'] == mt5.DEAL_ENTRY_OUT:  # Exit deal
+                    # Use deal volume to compute per-lot P&L statistics later
                     trades.append({
                         'profit': deal['profit'],
                         'commission': deal['commission'],
                         'swap': deal['swap'],
-                        'net_profit': deal['profit'] + deal['commission'] + deal['swap']
+                        'net_profit': deal['profit'] + deal['commission'] + deal['swap'],
+                        'volume': deal.get('volume', None)
                     })
             
             return trades
@@ -203,22 +226,36 @@ class ADXLiveTraderFixed:
             # If Kelly is disabled or balance too low, use minimum lot
             if not self.use_kelly or current_balance < 10:
                 return self.min_lot
+
+            # Session-based Kelly: use realized P&L from this session only
+            if self.use_session_kelly:
+                vol = self._kelly_volume_from_session(self.session_pnls, current_balance)
+                return vol
             
             # Get trade history from MT5
             trades = self.get_trade_history()
             
-            # If not enough trades, use conservative sizing
+            # If not enough trades, defer to broker minimum until stats mature (no global heuristics)
             if trades is None or len(trades) < self.min_trades_for_kelly:
-                # Use 1% of balance for initial trades
-                conservative_lot = (current_balance * 0.01) / 100
-                conservative_lot = max(self.min_lot, min(conservative_lot, 1.0))
-                conservative_lot = round(conservative_lot / self.lot_step) * self.lot_step
-                print(f"Not enough trades for Kelly ({len(trades) if trades else 0} < {self.min_trades_for_kelly}), using conservative lot: {conservative_lot}")
-                return conservative_lot
+                print(f"Not enough trades for Kelly ({len(trades) if trades else 0} < {self.min_trades_for_kelly}), using broker min lot: {self.min_lot}")
+                return self.min_lot
             
             # Calculate win rate and average win/loss
-            wins = [t['net_profit'] for t in trades if t['net_profit'] > 0]
-            losses = [abs(t['net_profit']) for t in trades if t['net_profit'] < 0]
+            # Compute per-lot net P&L where volume available; fallback to raw if not
+            wins = []
+            losses = []
+            for t in trades:
+                vol = t.get('volume') or 0
+                npnl = t['net_profit']
+                # If volume present and > 0, normalize per lot
+                if vol and vol > 0:
+                    per_lot_pnl = npnl / vol
+                else:
+                    per_lot_pnl = npnl
+                if per_lot_pnl > 0:
+                    wins.append(per_lot_pnl)
+                elif per_lot_pnl < 0:
+                    losses.append(abs(per_lot_pnl))
             
             if len(wins) == 0 or len(losses) == 0:
                 print("Insufficient win/loss data for Kelly")
@@ -237,7 +274,7 @@ class ADXLiveTraderFixed:
             # Calculate Kelly percentage
             kelly_percentage = (p * b - q) / b if b > 0 else 0
             
-            # Apply fractional Kelly (e.g., 25% of full Kelly)
+            # Apply fractional Kelly (e.g., 75% of full Kelly per kelly_fraction)
             kelly_percentage = kelly_percentage * self.kelly_fraction
             
             # Apply maximum risk per trade limit
@@ -248,10 +285,11 @@ class ADXLiveTraderFixed:
                 print(f"Kelly negative ({kelly_percentage:.2%}), using minimum lot")
                 return self.min_lot
             
-            # Calculate lot size based on Kelly percentage and account balance
-            # Assuming 1 lot = $100 margin for V100 (1s)
-            margin_per_lot = 100  # Adjust based on actual margin requirements
-            kelly_lot = (current_balance * kelly_percentage) / margin_per_lot
+            # Calculate lot size based on Kelly risk dollars and per-lot average loss
+            # Risk dollars per trade:
+            risk_dollars = current_balance * kelly_percentage
+            # Convert risk dollars into lots using expected loss per lot
+            kelly_lot = risk_dollars / avg_loss  # avg_loss is per-lot dollars
             
             # Round to lot step
             kelly_lot = round(kelly_lot / self.lot_step) * self.lot_step
@@ -269,45 +307,48 @@ class ADXLiveTraderFixed:
             return self.min_lot
 
     def calculate_adx_components(self, df: pd.DataFrame):
+        """Calculate DI+ and DI- using Pine-style Wilder smoothing, matching backtest."""
         try:
             high, low, close = df['high'], df['low'], df['close']
             prev_close = close.shift(1)
             tr1 = high - low
-            tr2 = abs(high - prev_close)
-            tr3 = abs(low - prev_close)
+            tr2 = (high - prev_close).abs()
+            tr3 = (low - prev_close).abs()
             true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             prev_high = high.shift(1)
             prev_low = low.shift(1)
             high_diff = high - prev_high
             low_diff = prev_low - low
-            dm_plus = np.where(high_diff > low_diff, np.maximum(high_diff, 0), 0)
-            dm_minus = np.where(low_diff > high_diff, np.maximum(low_diff, 0), 0)
-            true_range_series = pd.Series(true_range, index=df.index)
-            dm_plus_series = pd.Series(dm_plus, index=df.index)
-            dm_minus_series = pd.Series(dm_minus, index=df.index)
-            smoothed_tr = self._smooth_series(true_range_series)
-            smoothed_dm_plus = self._smooth_series(dm_plus_series)
-            smoothed_dm_minus = self._smooth_series(dm_minus_series)
-            di_plus = np.where(smoothed_tr > 0, (smoothed_dm_plus / smoothed_tr) * 100, 0)
-            di_minus = np.where(smoothed_tr > 0, (smoothed_dm_minus / smoothed_tr) * 100, 0)
-            di_plus = pd.Series(di_plus, index=df.index).fillna(0)
-            di_minus = pd.Series(di_minus, index=df.index).fillna(0)
+            dm_plus = pd.Series(np.where(high_diff > low_diff, np.maximum(high_diff, 0), 0), index=high.index)
+            dm_minus = pd.Series(np.where(low_diff > high_diff, np.maximum(low_diff, 0), 0), index=high.index)
+            smoothed_tr = self._pine_smooth(true_range)
+            smoothed_dm_plus = self._pine_smooth(dm_plus)
+            smoothed_dm_minus = self._pine_smooth(dm_minus)
+            di_plus = (smoothed_dm_plus / smoothed_tr).replace([np.inf, -np.inf], 0).fillna(0) * 100
+            di_minus = (smoothed_dm_minus / smoothed_tr).replace([np.inf, -np.inf], 0).fillna(0) * 100
             return di_plus, di_minus
         except Exception as e:
-            print(f"Error in ADX calculation: {e}")
+            print(f"Error in METACOG calculation: {e}")
             import traceback
             traceback.print_exc()
             return None, None
 
-    def _smooth_series(self, series: pd.Series):
+    def _pine_smooth(self, series: pd.Series):
+        """Pine-style smoothing recurrence used in backtest."""
         try:
-            # Wilder's smoothing can be computed via an EMA with alpha = 1/N
-            if self.analysis_length <= 0:
-                return series.astype(float)
-            return series.astype(float).ewm(alpha=1.0 / self.analysis_length, adjust=False).mean()
+            smoothed = pd.Series(0.0, index=series.index)
+            length = max(1, int(self.analysis_length))
+            for i in range(len(series)):
+                if i == 0:
+                    smoothed.iloc[i] = float(series.iloc[i])
+                else:
+                    prev_smoothed = smoothed.iloc[i-1]
+                    current_value = float(series.iloc[i])
+                    smoothed.iloc[i] = prev_smoothed - (prev_smoothed / length) + current_value
+            return smoothed
         except Exception as e:
             print(f"Error in smoothing: {e}")
-            return series
+            return series.astype(float)
 
     def detect_crossover_signal(self, di_plus, di_minus):
         try:
@@ -343,7 +384,7 @@ class ADXLiveTraderFixed:
                 "price": price,
                 "deviation": self.deviation,
                 "magic": self.magic_number,
-                "comment": f"ADX {signal} Kelly",
+                "comment": f"METACOG {signal}",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_FOK,
             }
@@ -380,7 +421,7 @@ class ADXLiveTraderFixed:
                 "price": price,
                 "deviation": self.deviation,
                 "magic": self.magic_number,
-                "comment": f"Close ADX {self.current_position['signal']}",
+                "comment": f"Close METACOG {self.current_position['signal']}",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_FOK,
             }
@@ -395,6 +436,11 @@ class ADXLiveTraderFixed:
             else:
                 pnl = (self.current_position['price'] - price) * self.current_position['volume'] * 100
             self.total_pnl += pnl
+            # Track session P&L and volume for session-based Kelly sizing
+            self.session_pnls.append({
+                'pnl': pnl,
+                'volume': self.current_position['volume']
+            })
             print(f"Position closed at {result.price:.5f}, P&L: ${pnl:.2f}")
             if pnl > 0:
                 self.winning_trades += 1
@@ -406,6 +452,48 @@ class ADXLiveTraderFixed:
             print(f"Error closing position: {e}")
             return False
 
+    def _kelly_volume_from_session(self, history_pnls, current_balance_local):
+        """Compute Kelly lot using session P&L (same formula as backtest)."""
+        try:
+            if len(history_pnls) < self.min_trades_for_kelly:
+                return self.min_lot
+            # Normalize per-lot P&L using stored volumes when available
+            wins = []
+            losses = []
+            for item in history_pnls:
+                if isinstance(item, dict):
+                    pnl = item.get('pnl', 0.0)
+                    vol = item.get('volume', 0.0)
+                else:
+                    pnl = float(item)
+                    vol = 0.0
+                per_lot = (pnl / vol) if vol and vol > 0 else pnl
+                if per_lot > 0:
+                    wins.append(per_lot)
+                elif per_lot < 0:
+                    losses.append(abs(per_lot))
+            if len(wins) == 0 or len(losses) == 0:
+                return self.min_lot
+            p = len(wins) / len(history_pnls)
+            avg_win = sum(wins) / len(wins)
+            avg_loss = sum(losses) / len(losses)
+            b = avg_win / avg_loss if avg_loss > 0 else 0.0
+            q = 1 - p
+            f = (b * p - q) / b if b > 0 else 0.0
+            f = max(0.0, min(f, self.max_risk_per_trade))
+            f *= self.kelly_fraction
+            if f <= 0:
+                return self.min_lot
+            # Convert desired risk dollars into lots using expected loss per lot
+            account_risk = current_balance_local * f
+            vol = account_risk / avg_loss
+            # Round and clamp
+            vol = round(vol / self.lot_step) * self.lot_step
+            vol = max(self.min_lot, min(vol, self.max_lot))
+            return vol
+        except Exception:
+            return self.min_lot
+
     def trading_loop(self):
         print("Starting trading loop...")
         while self.running:
@@ -414,7 +502,7 @@ class ADXLiveTraderFixed:
                 if not current_price:
                     time.sleep(1)
                     continue
-                df = self.get_historical_data(self.max_bars)
+                df = self.get_m1_from_ticks(self.max_bars)
                 if df is None or len(df) < self.analysis_length + 10:
                     time.sleep(5)
                     continue
@@ -423,16 +511,14 @@ class ADXLiveTraderFixed:
                     time.sleep(5)
                     continue
                 signal = None
-                if self.confirm_on_bar_close:
-                    current_bar_time = df.index[-1]
-                    if self.last_bar_time is None:
-                        self.last_bar_time = current_bar_time
-                    if current_bar_time != self.last_bar_time:
-                        self.last_bar_time = current_bar_time
-                        if len(di_plus) >= 3 and len(di_minus) >= 3:
-                            signal = self.detect_crossover_signal(di_plus.iloc[:-1], di_minus.iloc[:-1])
-                else:
-                    signal = self.detect_crossover_signal(di_plus, di_minus)
+                # Evaluate on closed bars only (df already excludes the last incomplete bar)
+                current_bar_time = df.index[-1]
+                if self.last_bar_time is None:
+                    self.last_bar_time = current_bar_time
+                if current_bar_time != self.last_bar_time:
+                    self.last_bar_time = current_bar_time
+                    if len(di_plus) >= 2 and len(di_minus) >= 2:
+                        signal = self.detect_crossover_signal(di_plus, di_minus)
                 if signal:
                     trade_price = current_price['ask'] if signal == "BUY" else current_price['bid']
                     bar_time_for_moderation = df.index[-2] if self.confirm_on_bar_close else df.index[-1]
@@ -470,11 +556,12 @@ class ADXLiveTraderFixed:
 
     def start_trading(self):
         print("=" * 60)
-        print("ADX LIVE TRADER FIXED STARTING")
+        print("METACOG LIVE TRADER STARTING")
         print("=" * 60)
         print(f"Symbol: {self.symbol}")
-        print(f"Lot Size: {self.lot_size}")
-        print(f"ADX Length: {self.analysis_length}")
+        # Lot size is computed dynamically; display placeholder
+        print("Lot Size: dynamic (Kelly-based)")
+        print(f"METACOG Length: {self.analysis_length}")
         print("=" * 60)
         try:
             if not self.connect_mt5():
@@ -500,7 +587,7 @@ class ADXLiveTraderFixed:
             print("Trading system stopped")
 
 def main():
-    print("ADX Live Trader - Fixed Version")
+    print("METACOG Live Trader")
     print("=" * 50)
     trader = ADXLiveTraderFixed()
     try:
